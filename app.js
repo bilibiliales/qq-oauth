@@ -187,7 +187,7 @@ app.post('/api/qq/auth/callback', async (req, res) => {
 });
 
 // 授权回调HTML页面
-app.get('/redirect', (req, res) => {
+app.get('/api/redirect', (req, res) => {
   res.send(`
     <!DOCTYPE html>
     <html>

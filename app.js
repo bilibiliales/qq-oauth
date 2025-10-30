@@ -1,274 +1,397 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { AlipaySdk } from 'alipay-sdk';
-import { config } from './config_mysql.js';
-import { db } from './database_mysql.js';
+import axios from 'axios';
+import crypto from 'crypto';
+import mysql from 'mysql2/promise';
 
 const app = express();
-const PORT = 3000;
+const HOST = '0.0.0.0';
+const PORT = 3100;
 
-// 中间件
+// 中间件配置
 app.use(express.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
+app.use(express.static('public'));
 
-// 支付宝配置
-const alipaySdk = new AlipaySdk({
-  appId: config.appId,
-  privateKey: config.privateKey,
-  alipayPublicKey: config.alipayPublicKey,
-  gateway: config.gatewayUrl
-});
-
-// VIP时间计算
-const calculateVipDate = (currentDate, goodsName) => {
-  const durationMap = {
-    '30天VIP月卡': 30 * 86400 * 1000,
-    '90天VIP季卡': 90 * 86400 * 1000,
-    '7天VIP周卡' : 7  * 86400 * 1000 
-  };
-  const now = new Date();
-  const baseDate = currentDate && currentDate > now ? currentDate : now;
-  return new Date(baseDate.getTime() + (durationMap[goodsName] || 0));
+// qq互联授权配置
+const qqConfig = {
+  appId: '102811774', // 换成自己的appId
+  appKey: 'jW5OSL1TfjbGhz5z', // 换成自己的appKey
+  redirectUri: 'https://zdjlales.xyz/api/redirect', // 换成http(s)://本服务运行时访问的域名/redirect
+  oauthUrl: 'https://graph.qq.com/oauth2.0/authorize', // 生成授权链接，不要动
+  tokenUrl: 'https://graph.qq.com/oauth2.0/token', // 获取access token的链接，不要动
+  userInfoUrl: 'https://graph.qq.com/user/get_user_info' // 获取头像和昵称的链接，不要动
 };
 
-// 商品列表接口
-app.get('/goods', async (req, res) => {
+// 创建MySQL数据库连接池
+const pool = mysql.createPool({
+  host: '127.0.0.1',
+  user: 'sa',
+  password: 'a1b2c3',
+  database: 'zdjlales',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  namedPlaceholders: true
+});
+
+// 获取授权链接
+app.get('/api/qq/auth/url', async (req, res) => {
   try {
-    const goodsList = await db.getGoodsList();
-    res.json(goodsList);
+    const state = crypto.randomUUID();
+    const encodedRedirectUri = encodeURIComponent(qqConfig.redirectUri);
+
+    // 构建完整授权URL
+    const authUrl = `${qqConfig.oauthUrl}?response_type=code&client_id=${qqConfig.appId}&redirect_uri=${encodedRedirectUri}&state=${state}`;
+
+    // 存储state到数据库（状态：待授权）
+    const connection = await pool.getConnection();
+    try {
+      await connection.execute(
+          'INSERT INTO qq_oauth (state, info) VALUES (:state, JSON_OBJECT("status", "pending"))',
+          { state }
+      );
+    } finally {
+      connection.release();
+    }
+
+    res.json({ auth_url: authUrl, state });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal Server Error', 
-      message: error.message 
-    });
+    res.status(500).json({ error: '获取授权链接失败', message: error.message });
   }
 });
 
-// VIP查询接口
-app.get('/vip', async (req, res) => {
-  try {
-    const userId = req.query.uid;
-    if (!userId) throw new Error('缺少用户ID');
-    
-    const expiryDate = await db.getVipExpiryDate(userId);
-    res.json({ expiryDate });
-  } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal Server Error', 
-      message: error.message 
-    });
-  }
-});
+// 授权结果查询
+app.get('/api/qq/auth/verify', async (req, res) => {
+  const { state } = req.query;
+  if (!state) return res.status(400).json({ error: '缺少state参数' });
 
-// 用户注册接口
-app.get('/regist', async (req, res) => {
   try {
-    const userId = req.query.uid;
-    if (!userId) throw new Error('参数错误');
+    const connection = await pool.getConnection();
+    try {
+      const maxWaitTime = 10000;
+      const checkInterval = 1000;
+      let elapsedTime = 0;
+      let result = null;
 
-    const exist = await db.getVipExpiryDate(userId);
-    if (exist === null) {
-      const result = await db.createUser(userId);
-      if (result === "SUCCESS") {
-        return res.status(200).json({ status: "SUCCESS" });
+      while (elapsedTime < maxWaitTime) {
+        const [rows] = await connection.execute(
+            'SELECT info FROM qq_oauth WHERE state = :state',
+            { state }
+        );
+
+        if (rows.length === 0) {
+          result = { status: 'invalid', message: 'state不存在' };
+          break;
+        }
+
+        const info = rows[0].info;
+
+        if (info.status !== 'pending') {
+          if (info.status === 'completed') {
+            result = {
+              status: 'completed',
+              data: {
+                openid: info.openid,
+                nickname: info.nickname,
+                avatar: info.avatar
+              }
+            };
+            await connection.execute('DELETE FROM qq_oauth WHERE state = :state', { state });
+          } else {
+            result = { status: info.status, message: info.message || '授权失败' };
+          }
+          break;
+        }
+
+        await new Promise(resolve => setTimeout(resolve, checkInterval));
+        elapsedTime += checkInterval;
       }
-      throw new Error('用户创建失败');
+
+      if (!result) {
+        result = { status: 'pending', message: '授权处理中，请稍后重试' };
+      }
+
+      res.json(result);
+    } finally {
+      connection.release();
     }
-    res.status(200).json({ status: "HasRegisted" });
   } catch (error) {
-    res.status(500).json({ 
-      error: 'Internal Server Error', 
-      message: error.message 
-    });
+    res.status(500).json({ error: '查询授权结果失败', message: error.message });
   }
 });
 
-// 订单创建接口
-app.post('/createTrade', async (req, res) => {
+// 授权回调处理
+app.post('/api/qq/auth/callback', async (req, res) => {
+  const { code, state } = req.body;
+  if (!code || !state) {
+    return res.status(400).json({ error: '缺少code或state参数' });
+  }
+
   try {
-    const { userId, goodsName } = req.body;
-    
-    // 参数校验
-    if (!userId || !goodsName) {
-      return res.status(400).json({ error: '参数不完整' });
-    }
+    const connection = await pool.getConnection();
+    try {
+      // 验证state有效性
+      const [stateRows] = await connection.execute(
+          'SELECT info FROM qq_oauth WHERE state = :state',
+          { state }
+      );
+      if (stateRows.length === 0) {
+        return res.status(400).json({ error: '无效的state参数' });
+      }
 
-    // 并行校验用户和商品
-    const [userExist, stock] = await Promise.all([
-      db.getVipExpiryDate(userId),
-      db.getGoodsStock(goodsName)
-    ]);
+      // 获取access_token和openid
+      const encodedRedirectUri = encodeURIComponent(qqConfig.redirectUri);
+      const tokenUrl = `${qqConfig.tokenUrl}?grant_type=authorization_code&client_id=${qqConfig.appId}&client_secret=${qqConfig.appKey}&code=${code}&redirect_uri=${encodedRedirectUri}&fmt=json&need_openid=1`;
 
-    if (!userExist) return res.status(200).json({ status: "NO_USER" });
-    if (stock === null) return res.status(200).json({ status: "NO_GOODS" });
+      const tokenResponse = await axios.get(tokenUrl);
+      const { access_token: accessToken, openid } = tokenResponse.data;
+      if (!accessToken || !openid) {
+        throw new Error(`获取access_token或openid失败: ${tokenResponse.data}`);
+      }
 
-    // 检查15分钟内是否存在同名未支付订单
-    const existingOrderId = await db.getUnpaidOrder(userId, goodsName, 15);
-    if (existingOrderId) {
-      const payUrl = alipaySdk.pageExec("alipay.trade.wap.pay", "GET", {
-        bizContent: {
-          out_trade_no: existingOrderId.trade_no,
-          total_amount: existingOrderId.total_amount,
-          subject: existingOrderId.goods_name,
-          product_code: "QUICK_WAP_WAY",
-          seller_id: "2088721011046051",
-        },
-        notify_url: "http://47.96.116.182:3000/notify",
-        return_url: "http://47.96.116.182:3000/return",
+      // 获取用户信息（昵称、头像）
+      const userInfoResponse = await axios.get(qqConfig.userInfoUrl, {
+        params: {
+          access_token: accessToken,
+          oauth_consumer_key: qqConfig.appId,
+          openid
+        }
       });
-      return res.status(200).json({ status: payUrl });
-    } 
-    // 生成新的订单
-    else {
-        // 让之前有未支付订单的用户能够忽略库存限制
-        if (stock <= 0) return res.status(200).json({ status: "SOLD_OUT" });
+      const userInfo = userInfoResponse.data;
+      if (userInfo.ret !== 0) {
+        throw new Error(`获取用户信息失败: ${userInfo.msg}`);
+      }
 
-        // 库存减少操作
-        const reduceResult = await db.reduceGoodsStock(goodsName);
-        if (reduceResult !== "SUCCESS") {
-          return res.status(200).json({ status: "SOLD_OUT" });
-        }
+      // 更新数据库状态（状态：已完成）
+      await connection.execute(
+          'UPDATE qq_oauth SET info = :info WHERE state = :state',
+          {
+            state,
+            info: JSON.stringify({
+              status: 'completed',
+              openid,
+              nickname: userInfo.nickname,
+              avatar: userInfo.figureurl_qq
+            })
+          }
+      );
 
-        try {
-            // 生成订单信息
-            const totalAmount = await db.getGoodsPrice(goodsName);
-            const outTradeNo = `zdjlales${Date.now()}${userId}`;
-            // 支付宝请求
-            const payUrl = alipaySdk.pageExec("alipay.trade.wap.pay", "GET", {
-            bizContent: {
-                out_trade_no: outTradeNo,
-                total_amount: totalAmount,
-                subject: goodsName,
-                product_code: "QUICK_WAP_WAY",
-                seller_id: "2088721011046051",
-            },
-            notify_url: "http://47.96.116.182:3000/notify",
-            return_url: "http://47.96.116.182:3000/return",
-            });
-
-            // 创建订单记录
-            await db.createTrade(outTradeNo, goodsName, userId, totalAmount);
-            return res.status(200).json({ status: payUrl });
-        } catch (error) {
-            // 恢复库存
-            await db.plusGoodsStockByGoodsName(goodsName);
-            res.status(500).json({ 
-                error: 'Internal Server Error', 
-                message: error.message 
-            });
-        }
+      res.json({ success: true, message: '授权成功' });
+    } finally {
+      connection.release();
     }
   } catch (error) {
-    console.error(error)
-    res.status(500).json({ 
-      error: 'Internal Server Error', 
-      message: error.message 
-    });
+    res.status(500).json({ error: '授权处理失败', message: error.message });
   }
 });
 
-// 异步通知接口
-app.post('/notify', async (req, res) => {
-  try {
-    const { out_trade_no, trade_status } = req.body;
-    
-    // 基础校验
-    if (!out_trade_no || !trade_status) {
-      console.error('无效通知参数');
-      return res.send('fail');
-    }
-
-    // 验签校验
-    if (!alipaySdk.checkNotifySign(req.body)) {
-      console.error('验签失败:', out_trade_no);
-      return res.send('fail');
-    }
-
-    // 获取订单状态
-    const currentStatus = await db.getTradeStatusById(out_trade_no);
-    if (!currentStatus) {
-      console.error('订单不存在:', out_trade_no);
-      return res.send('fail');
-    }
-
-    // 处理交易关闭
-    if (trade_status === 'TRADE_CLOSED') {
-      if (currentStatus === 'WAIT_BUYER_PAY') {
-        await db.plusGoodsStockByTradeId(out_trade_no);
-      }
-      return res.send('success');
-    }
-
-    // 处理交易成功
-    if (['TRADE_SUCCESS', 'TRADE_FINISHED'].includes(trade_status)) {
-      if (currentStatus === 'TRADE_SUCCESS') {
-        return res.send('success'); // 防止重复处理
-      }
-
-      // 更新订单状态
-      const updateResult = await db.updateTradeStatus(out_trade_no, 'TRADE_SUCCESS');
-      if (updateResult !== "SUCCESS") {
-        throw new Error('订单状态更新失败');
-      }
-
-      // 更新VIP有效期
-      const user = await db.getTradeUser(out_trade_no);
-      const goods = await db.getTradeGoods(out_trade_no);
-      const currentExpiry = await db.getVipExpiryDate(user);
-      const newExpiry = calculateVipDate(currentExpiry, goods.name);
-      
-      await db.updateUserVipExpiryDate(user, newExpiry);
-    }
-
-    res.send('success');
-  } catch (error) {
-    console.error('通知处理异常:', error);
-    res.send('fail');
-  }
+// 授权回调HTML页面
+app.get('/redirect', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>QQ授权回调</title>
+      <script src="https://cdn.tailwindcss.com"></script>
+    </head>
+    <body class="flex items-center justify-center min-h-screen bg-gray-100">
+      <div class="text-center">
+        <div class="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500 mx-auto"></div>
+        <p class="mt-4 text-gray-700">正在处理授权，请稍候...</p>
+      </div>
+      <script>
+        // 解析URL参数并调用后端接口
+        const params = new URLSearchParams(window.location.search);
+        fetch('/api/qq/auth/callback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code: params.get('code'),
+            state: params.get('state')
+          })
+        })
+        .then(res => res.json())
+        .then(data => {
+          document.querySelector('p').textContent = data.success ? 
+            '授权成功！即将关闭窗口...' : 
+            '授权失败: ' + (data.error || '未知错误');
+          setTimeout(() => window.close(), 2000);
+        });
+      </script>
+    </body>
+    </html>
+  `);
 });
 
-// 同步返回接口
-app.get('/return', async (req, res) => {
-  try {
-    const { out_trade_no } = req.query;
+// HTML主页
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>QQ授权演示</title>
+      <script src="https://cdn.tailwindcss.com"></script>
+    </head>
+    <body class="bg-gray-100 min-h-screen">
+      <nav class="bg-blue-600 text-white p-4">
+        <div class="container mx-auto flex justify-between items-center">
+          <h1 class="text-xl font-bold">QQ授权Demo</h1>
+          <a href="/login" class="bg-white text-blue-600 px-4 py-2 rounded">登录</a>
+        </div>
+      </nav>
+      <div class="container mx-auto p-8 text-center">
+        <h2 class="text-3xl font-bold mb-8 text-gray-800">欢迎使用QQ授权服务</h2>
+        <a href="/login" class="bg-blue-600 text-white px-6 py-3 rounded-lg text-lg hover:bg-blue-700 transition">
+          前往登录
+        </a>
+      </div>
+    </body>
+    </html>
+  `);
+});
 
-    // 参数校验
-    if (!out_trade_no) {
-      return res.send("订单号参数缺失");
-    }
-    // 验签校验
-    if (!alipaySdk.checkNotifySign(req.query)) {
-      return res.send("验签失败，请勿重复提交");
-    }
-    // 获取订单详情
-    const status = await db.getTradeStatusById(out_trade_no);
-    const goodsInfo = await db.getTradeGoods(out_trade_no);
-    const expiryDate = await db.getVipExpiryDate(await db.getTradeUser(out_trade_no));
-    // 构建响应信息
-    let message;
-    switch(status) {
-      case 'TRADE_SUCCESS':
-        message = `支付成功！您已成功购买${goodsInfo.name}，VIP有效期至${expiryDate}`;
-        break;
-      case 'WAIT_BUYER_PAY':
-        message = "等待支付中，若已完成支付请稍后刷新";
-        break;
-      default:
-        message = "支付状态异常，请联系客服";
-    }
-    res.send(`
-      <h2>支付结果通知</h2>
-      <p>${message}</p>
-      <p>订单号：${out_trade_no}</p>
-    `);
-  } catch (error) {
-    console.error(error)
-    res.send("系统繁忙，请稍后再试");
-  }
+// HTML登录页
+app.get('/login', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>登录</title>
+      <script src="https://cdn.tailwindcss.com"></script>
+    </head>
+    <body class="bg-gray-100 min-h-screen flex items-center justify-center">
+      <div class="bg-white p-8 rounded-lg shadow-md w-96">
+        <!-- 登录表单容器（授权成功后隐藏） -->
+        <div id="loginForm">
+          <h2 class="text-2xl font-bold mb-6 text-center text-gray-800">账号登录</h2>
+          
+          <!-- 用户名密码框 -->
+          <div class="mb-4">
+            <label class="block text-gray-700 mb-2">用户名</label>
+            <input type="text" class="w-full px-3 py-2 border rounded" placeholder="输入用户名">
+          </div>
+          <div class="mb-6">
+            <label class="block text-gray-700 mb-2">密码</label>
+            <input type="password" class="w-full px-3 py-2 border rounded" placeholder="输入密码">
+          </div>
+          
+          <!-- 普通登录按钮 -->
+          <button id="loginBtn" style="margin-bottom: 10px" class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700 transition flex items-center justify-center">
+            登录
+          </button>
+          
+          <!-- QQ登录按钮 -->
+          <button id="qqLoginBtn" class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700 transition flex items-center justify-center">
+            <img src="https://qzonestyle.gtimg.cn/qzone/qzact/act/external/tiqq/logo.png" alt="QQ快捷登录" style="width: 20px; height: 20px; margin-right: 10px">
+              QQ快捷登录
+            </img>
+          </button>
+          
+          <div id="authResult" class="mt-4 text-center text-gray-600 hidden"></div>
+        </div>
+     
+        <!-- 授权成功界面（初始隐藏） -->
+        <div id="authSuccess" class="text-center hidden">
+          <h2 class="text-2xl font-bold mb-6 text-green-600">授权成功</h2>
+          
+          <!-- 头像（居中） -->
+          <div class="flex justify-center mb-4">
+            <img id="avatarImg" src="" alt="用户头像" class="w-32 h-32 rounded-full border-4 border-blue-100 object-cover">
+          </div>
+          
+          <!-- 昵称 -->
+          <h3 id="nicknameText" class="text-xl font-semibold text-gray-800 mb-6"></h3>
+          
+          <!-- 确定按钮 -->
+          <button id="confirmBtn" class="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700 transition mb-4">
+            确定
+          </button>
+          
+          <!-- OpenID小字 -->
+          <p id="openidText" class="text-xs text-gray-500 mt-2"></p>
+        </div>
+     
+      <script>
+        // 长轮询检查授权结果
+        const checkAuthResult = (state) => {
+          const authResult = document.getElementById('authResult');
+          const loginForm = document.getElementById('loginForm');
+          const authSuccess = document.getElementById('authSuccess');
+          const avatarImg = document.getElementById('avatarImg');
+          const nicknameText = document.getElementById('nicknameText');
+          const openidText = document.getElementById('openidText');
+          
+          authResult.classList.remove('hidden');
+          
+          fetch(\`/api/qq/auth/verify?state=\${state}\`)
+            .then(res => res.json())
+            .then(result => {
+              switch (result.status) {
+                case 'completed': {
+                  // 隐藏登录表单，显示授权成功界面
+                  loginForm.classList.add('hidden');
+                  authSuccess.classList.remove('hidden');
+                  
+                  // 填充数据
+                  avatarImg.src = result.data.avatar || 'https://via.placeholder.com/128'; // 默认头像
+                  nicknameText.textContent = result.data.nickname || '未知用户';
+                  openidText.textContent = \`QQ账号唯一标识: \${result.data.openid}\`;
+                  
+                  // 确定按钮事件
+                  document.getElementById('confirmBtn').addEventListener('click', () => {
+                    window.location.href = '/';
+                  });
+                  break;
+                }
+                case 'pending': {
+                  authResult.textContent = '授权处理中...';
+                  setTimeout(() => checkAuthResult(state), 10000);
+                  break;
+                }
+                default: {
+                  authResult.textContent = \`授权失败: \${result.message || '未知错误'}\`;
+                }
+              }
+            })
+            .catch(error => {
+              authResult.textContent = \`查询失败: \${error.message}\`;
+              setTimeout(() => checkAuthResult(state), 10000); // 出错重试
+            });
+        };
+        
+        // 普通登录
+        document.getElementById('loginBtn').addEventListener('click', () => {
+          alert("登录失败，请稍后重试");
+        });
+ 
+        // 点击QQ登录按钮触发授权
+        document.getElementById('qqLoginBtn').addEventListener('click', () => {
+          fetch('/api/qq/auth/url')
+            .then(res => res.json())
+            .then(data => {
+              if (data.auth_url) {
+                // 打开QQ授权窗口
+                const authWindow = window.open(
+                  data.auth_url,
+                  'QQ授权',
+                  'width=800,height=600'
+                );
+                // 开始长轮询检查结果
+                checkAuthResult(data.state);
+              }
+            })
+            .catch(error => {
+              document.getElementById('authResult').textContent = \`获取授权链接失败: \${error.message}\`;
+            });
+        });
+      </script>
+    </body>
+    </html>
+  `);
 });
 
 // 启动服务
-app.listen(PORT, () => {
-  console.log(`MySQL适配版服务器已启动，端口：${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`服务器已启动，运行地址：http://${HOST}:${PORT}`);
 });

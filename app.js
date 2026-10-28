@@ -16,7 +16,7 @@ app.use(express.static('public'));
 // qq互联授权配置
 const qqConfig = {
   appId: '102811774', // 换成自己的appId
-  appKey: 'jW5OSL1TfjbGhz5z', // 换成自己的appKey
+  appKey: '***', // 换成自己的appKey
   redirectUri: 'https://zdjlales.xyz/api/redirect', // 换成http(s)://本服务运行时访问的域名/redirect
   oauthUrl: 'https://graph.qq.com/oauth2.0/authorize', // 生成授权链接，不要动
   tokenUrl: 'https://graph.qq.com/oauth2.0/token', // 获取access token的链接，不要动
